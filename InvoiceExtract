@@ -22,7 +22,7 @@
 var GEMINI_API_KEY     = "YOUR_GEMINI_API_KEY"; // ← điền API key ở đây
 var GEMINI_MODEL       = "gemini-2.5-flash";   // model Gemini hỗ trợ generateContent
 var SHEET_NAME         = "Transactions";
-var MAX_EMAILS         = 100; // số thread xử lý mỗi lần gọi GmailApp.search
+var MAX_EMAILS         = 100; // số threads xử lý mỗi lần gọi GmailApp.search
 var LOOKBACK_DAYS      = 30;  // quét trong N ngày gần nhất
 var DEFAULT_RUN_MODE   = "NEW"; // NEW | DEBUG
 var LOCK_WAIT_MS       = 30000;
