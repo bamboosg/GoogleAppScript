@@ -19,10 +19,21 @@
  */
 
 // ─── CẤU HÌNH ────────────────────────────────────────────────────────────────
-var GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"; // ← điền API key ở đây
-var GMAIL_QUERY    = "is:unread subject:(thanh toán OR giao dịch OR invoice OR payment OR receipt)";
-var SHEET_NAME     = "Transactions";
-var MAX_EMAILS     = 20; // số mail xử lý mỗi lần chạy
+var GEMINI_API_KEY     = "YOUR_GEMINI_API_KEY"; // ← điền API key ở đây
+var GEMINI_MODEL       = "gemini-2.5-flash";   // model Gemini hỗ trợ generateContent
+var SHEET_NAME         = "Transactions";
+var MAX_EMAILS         = 100; // số threads xử lý mỗi lần gọi GmailApp.search
+var LOOKBACK_DAYS      = 30;  // quét trong N ngày gần nhất
+var DEFAULT_RUN_MODE   = "NEW"; // NEW | DEBUG
+var LOCK_WAIT_MS       = 30000;
+var MAX_BODY_LENGTH    = 3000;
+var INVOICE_KEYWORDS   = [
+  "hóa đơn", "hoá đơn", "invoice", "e-invoice", "vat",
+  "biên lai", "receipt", "payment", "thanh toán", "giao dịch"
+];
+var INVOICE_KEYWORDS_LOWER = INVOICE_KEYWORDS.map(function (keyword) {
+  return keyword.toLowerCase();
+});
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -30,61 +41,118 @@ var MAX_EMAILS     = 20; // số mail xử lý mỗi lần chạy
  * Luôn ghi subject + date dù Gemini có lỗi hay không.
  */
 function processEmails() {
-  var sheet = getOrCreateSheet(SHEET_NAME);
-  var threads = GmailApp.search(GMAIL_QUERY, 0, MAX_EMAILS);
+  processEmailsByMode(DEFAULT_RUN_MODE);
+}
 
-  if (threads.length === 0) {
-    Logger.log("Không có mail mới.");
+/**
+ * Mode NEW: quét mail mới (unread) trong 30 ngày.
+ */
+function processEmailsNewMode() {
+  processEmailsByMode("NEW");
+}
+
+/**
+ * Mode DEBUG: quét toàn bộ mail trong 30 ngày (kể cả đã đọc).
+ */
+function processEmailsDebugMode() {
+  processEmailsByMode("DEBUG");
+}
+
+function processEmailsByMode(mode) {
+  var runMode = (mode || DEFAULT_RUN_MODE).toUpperCase();
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_WAIT_MS)) {
+    Logger.log("Không lấy được lock, bỏ qua lượt chạy để tránh ghi trùng.");
     return;
   }
 
-  threads.forEach(function (thread) {
-    var msg     = thread.getMessages()[0];
-    var subject = msg.getSubject();
-    var date    = msg.getDate();
-    var body    = msg.getPlainBody().substring(0, 3000); // giới hạn 3000 ký tự
-    var msgId   = msg.getId();
+  try {
+    var sheet = getOrCreateSheet(SHEET_NAME);
+    var existingIds = getExistingMessageIdMap(sheet);
+    var idsInCurrentRun = {};
+    var lookupDate = new Date();
+    lookupDate.setDate(lookupDate.getDate() - LOOKBACK_DAYS);
 
-    // Kiểm tra đã xử lý chưa (tránh trùng)
-    if (isAlreadyProcessed(sheet, msgId)) {
-      thread.markRead();
-      return;
+    var query = buildModeQuery(runMode);
+    var start = 0;
+    var scanned = 0;
+    var inserted = 0;
+
+    while (true) {
+      var threads = GmailApp.search(query, start, MAX_EMAILS);
+      if (threads.length === 0) break;
+
+      threads.forEach(function (thread) {
+        var messages = thread.getMessages();
+
+        messages.forEach(function (msg) {
+          if (msg.getDate() < lookupDate) return;
+          if (runMode === "NEW" && !msg.isUnread()) return;
+
+          var subject = msg.getSubject() || "";
+          var body = msg.getPlainBody() || "";
+          var bodyPreview = body.substring(0, MAX_BODY_LENGTH);
+          var msgId = msg.getId();
+          scanned++;
+
+          if (!isInvoiceEmail(subject, body)) {
+            if (runMode === "NEW") msg.markRead();
+            return;
+          }
+
+          if (existingIds[msgId] || idsInCurrentRun[msgId]) {
+            if (runMode === "NEW") msg.markRead();
+            return;
+          }
+
+          // ── BƯỚC 1: Ghi raw ngay lập tức ──────────────────────────────────
+          var row = sheet.getLastRow() + 1;
+          sheet.getRange(row, 1).setValue(msg.getDate());              // A
+          sheet.getRange(row, 2).setValue(subject);                    // B
+          sheet.getRange(row, 3).setValue(bodyPreview);                // C
+          sheet.getRange(row, 4).setValue("PENDING");                  // D
+          sheet.getRange(row, 9).setValue(msgId);                      // I
+          SpreadsheetApp.flush();
+          // ──────────────────────────────────────────────────────────────────
+
+          existingIds[msgId] = true;
+          idsInCurrentRun[msgId] = true;
+          inserted++;
+
+          // ── BƯỚC 2: Gọi Gemini parse chi tiết ────────────────────────────
+          var parsed = null;
+          try {
+            parsed = askGemini(subject, bodyPreview);
+          } catch (e) {
+            Logger.log("Gemini lỗi với mail '" + subject + "': " + e.message);
+          }
+
+          // ── BƯỚC 3: Ghi kết quả hoặc đánh dấu lỗi ────────────────────────
+          if (parsed) {
+            sheet.getRange(row, 4).setValue("OK");
+            sheet.getRange(row, 5).setValue(parsed.amount   || "");  // E
+            sheet.getRange(row, 6).setValue(parsed.type     || "");  // F
+            sheet.getRange(row, 7).setValue(parsed.merchant || "");  // G
+            sheet.getRange(row, 8).setValue(parsed.note     || "");  // H
+          } else {
+            sheet.getRange(row, 4).setValue("LỖI – CẦN XỬ LÝ THỦ CÔNG");
+          }
+
+          if (runMode === "NEW") msg.markRead();
+          SpreadsheetApp.flush();
+        });
+      });
+
+      start += threads.length;
     }
 
-    // ── BƯỚC 1: Ghi raw ngay lập tức ────────────────────────────────────────
-    var row = sheet.getLastRow() + 1;
-    sheet.getRange(row, 1).setValue(date);        // A: Ngày nhận
-    sheet.getRange(row, 2).setValue(subject);     // B: Tiêu đề
-    sheet.getRange(row, 3).setValue(body);        // C: Nội dung gốc
-    sheet.getRange(row, 4).setValue("PENDING");   // D: Trạng thái
-    sheet.getRange(row, 9).setValue(msgId);       // I: Message ID (ẩn)
-    SpreadsheetApp.flush();                       // lưu ngay để không mất dữ liệu
-    // ────────────────────────────────────────────────────────────────────────
-
-    // ── BƯỚC 2: Gọi Gemini parse chi tiết ────────────────────────────────────
-    var parsed = null;
-    try {
-      parsed = askGemini(subject, body);
-    } catch (e) {
-      Logger.log("Gemini lỗi với mail '" + subject + "': " + e.message);
-    }
-
-    // ── BƯỚC 3: Ghi kết quả hoặc đánh dấu lỗi ────────────────────────────────
-    if (parsed) {
-      sheet.getRange(row, 4).setValue("OK");
-      sheet.getRange(row, 5).setValue(parsed.amount   || "");  // E: Số tiền
-      sheet.getRange(row, 6).setValue(parsed.type     || "");  // F: Loại GD
-      sheet.getRange(row, 7).setValue(parsed.merchant || "");  // G: Merchant
-      sheet.getRange(row, 8).setValue(parsed.note     || "");  // H: Ghi chú
-    } else {
-      sheet.getRange(row, 4).setValue("LỖI – CẦN XỬ LÝ THỦ CÔNG");
-    }
-
-    thread.markRead();
-    SpreadsheetApp.flush();
-  });
-
-  Logger.log("Xử lý xong " + threads.length + " thread(s).");
+    Logger.log(
+      "Mode " + runMode + ": đã quét " + scanned + " mail trong " + LOOKBACK_DAYS +
+      " ngày, thêm mới " + inserted + " mail hóa đơn."
+    );
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
@@ -106,10 +174,10 @@ function askGemini(subject, body) {
     "Nội dung mail:\n" + body
   ].join("\n");
 
-  var url     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + GEMINI_API_KEY;
+  var url     = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
   var payload = JSON.stringify({
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0, maxOutputTokens: 512 }
+    generationConfig: { temperature: 0, maxOutputTokens: 1024 }
   });
 
   var response = UrlFetchApp.fetch(url, {
@@ -124,13 +192,24 @@ function askGemini(subject, body) {
     throw new Error("HTTP " + code + ": " + response.getContentText().substring(0, 200));
   }
 
-  var json  = JSON.parse(response.getContentText());
-  var text  = json.candidates[0].content.parts[0].text.trim();
+  var json      = JSON.parse(response.getContentText());
+  var candidate = json.candidates[0];
 
-  // Loại bỏ markdown code block nếu có
-  text = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/, "").trim();
+  // Phát hiện response bị cắt do hết token
+  if (candidate.finishReason === "MAX_TOKENS") {
+    throw new Error("Gemini trả về response bị cắt ngắn (MAX_TOKENS) – JSON không đầy đủ.");
+  }
 
-  return JSON.parse(text);
+  var text = candidate.content.parts[0].text.trim();
+
+  // Trích xuất block JSON ({...}) – dùng greedy để giữ nguyên giá trị chuỗi
+  // có thể chứa ký tự '}' bên trong (VD: note: "Xem {chi tiết}").
+  var match = text.match(/\{[\s\S]*\}/);
+  if (!match) {
+    throw new Error("Gemini không trả về JSON hợp lệ: " + text.substring(0, 100));
+  }
+
+  return JSON.parse(match[0]);
 }
 
 // ─── TIỆN ÍCH ─────────────────────────────────────────────────────────────────
@@ -157,12 +236,29 @@ function getOrCreateSheet(name) {
 /**
  * Kiểm tra message ID đã có trong sheet chưa để tránh xử lý trùng.
  */
-function isAlreadyProcessed(sheet, msgId) {
+function getExistingMessageIdMap(sheet) {
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return false;
+  if (lastRow < 2) return {};
   var ids = sheet.getRange(2, 9, lastRow - 1, 1).getValues();
+  var idMap = {};
   for (var i = 0; i < ids.length; i++) {
-    if (ids[i][0] === msgId) return true;
+    if (ids[i][0]) idMap[ids[i][0]] = true;
+  }
+  return idMap;
+}
+
+function buildModeQuery(mode) {
+  var q = "newer_than:" + LOOKBACK_DAYS + "d";
+  if (mode === "NEW") {
+    q += " is:unread";
+  }
+  return q;
+}
+
+function isInvoiceEmail(subject, body) {
+  var text = (subject + "\n" + body).toLowerCase();
+  for (var i = 0; i < INVOICE_KEYWORDS_LOWER.length; i++) {
+    if (text.indexOf(INVOICE_KEYWORDS_LOWER[i]) !== -1) return true;
   }
   return false;
 }
@@ -259,7 +355,8 @@ function setupTrigger() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("📧 Email Tracker")
-    .addItem("▶ Chạy ngay",            "processEmails")
+    .addItem("▶ Chạy ngay (mail mới)", "processEmailsNewMode")
+    .addItem("🛠 Chạy debug (30 ngày)", "processEmailsDebugMode")
     .addItem("🔄 Retry lỗi / pending", "retryFailedRows")
     .addItem("⏱ Cài trigger tự động",  "setupTrigger")
     .addToUi();
