@@ -177,7 +177,7 @@ function askGemini(subject, body) {
   var url     = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
   var payload = JSON.stringify({
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0, maxOutputTokens: 512 }
+    generationConfig: { temperature: 0, maxOutputTokens: 1024 }
   });
 
   var response = UrlFetchApp.fetch(url, {
@@ -192,13 +192,24 @@ function askGemini(subject, body) {
     throw new Error("HTTP " + code + ": " + response.getContentText().substring(0, 200));
   }
 
-  var json  = JSON.parse(response.getContentText());
-  var text  = json.candidates[0].content.parts[0].text.trim();
+  var json      = JSON.parse(response.getContentText());
+  var candidate = json.candidates[0];
 
-  // Loại bỏ markdown code block nếu có
-  text = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/, "").trim();
+  // Phát hiện response bị cắt do hết token
+  if (candidate.finishReason === "MAX_TOKENS") {
+    throw new Error("Gemini trả về response bị cắt ngắn (MAX_TOKENS) – JSON không đầy đủ.");
+  }
 
-  return JSON.parse(text);
+  var text = candidate.content.parts[0].text.trim();
+
+  // Trích xuất block JSON ({...}) – dùng greedy để giữ nguyên giá trị chuỗi
+  // có thể chứa ký tự '}' bên trong (VD: note: "Xem {chi tiết}").
+  var match = text.match(/\{[\s\S]*\}/);
+  if (!match) {
+    throw new Error("Gemini không trả về JSON hợp lệ: " + text.substring(0, 100));
+  }
+
+  return JSON.parse(match[0]);
 }
 
 // ─── TIỆN ÍCH ─────────────────────────────────────────────────────────────────
