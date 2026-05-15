@@ -20,6 +20,7 @@
 
 // ─── CẤU HÌNH ────────────────────────────────────────────────────────────────
 var GEMINI_API_KEY     = "YOUR_GEMINI_API_KEY"; // ← điền API key ở đây
+var GEMINI_MODEL       = "gemini-2.5-flash";   // model Gemini hỗ trợ generateContent
 var SHEET_NAME         = "Transactions";
 var MAX_EMAILS         = 100; // số thread xử lý mỗi lần gọi GmailApp.search
 var LOOKBACK_DAYS      = 30;  // quét trong N ngày gần nhất
@@ -173,7 +174,7 @@ function askGemini(subject, body) {
     "Nội dung mail:\n" + body
   ].join("\n");
 
-  var url     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + GEMINI_API_KEY;
+  var url     = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
   var payload = JSON.stringify({
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: { temperature: 0, maxOutputTokens: 512 }
