@@ -24,10 +24,15 @@ var SHEET_NAME         = "Transactions";
 var MAX_EMAILS         = 100; // số thread xử lý mỗi lần gọi GmailApp.search
 var LOOKBACK_DAYS      = 30;  // quét trong N ngày gần nhất
 var DEFAULT_RUN_MODE   = "NEW"; // NEW | DEBUG
+var LOCK_WAIT_MS       = 30000;
+var MAX_BODY_LENGTH    = 3000;
 var INVOICE_KEYWORDS   = [
   "hóa đơn", "hoá đơn", "invoice", "e-invoice", "vat",
   "biên lai", "receipt", "payment", "thanh toán", "giao dịch"
 ];
+var INVOICE_KEYWORDS_LOWER = INVOICE_KEYWORDS.map(function (keyword) {
+  return keyword.toLowerCase();
+});
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -55,7 +60,7 @@ function processEmailsDebugMode() {
 function processEmailsByMode(mode) {
   var runMode = (mode || DEFAULT_RUN_MODE).toUpperCase();
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) {
+  if (!lock.tryLock(LOCK_WAIT_MS)) {
     Logger.log("Không lấy được lock, bỏ qua lượt chạy để tránh ghi trùng.");
     return;
   }
@@ -85,6 +90,7 @@ function processEmailsByMode(mode) {
 
           var subject = msg.getSubject() || "";
           var body = msg.getPlainBody() || "";
+          var bodyPreview = body.substring(0, MAX_BODY_LENGTH);
           var msgId = msg.getId();
           scanned++;
 
@@ -102,7 +108,7 @@ function processEmailsByMode(mode) {
           var row = sheet.getLastRow() + 1;
           sheet.getRange(row, 1).setValue(msg.getDate());              // A
           sheet.getRange(row, 2).setValue(subject);                    // B
-          sheet.getRange(row, 3).setValue(body.substring(0, 3000));    // C
+          sheet.getRange(row, 3).setValue(bodyPreview);                // C
           sheet.getRange(row, 4).setValue("PENDING");                  // D
           sheet.getRange(row, 9).setValue(msgId);                      // I
           SpreadsheetApp.flush();
@@ -115,7 +121,7 @@ function processEmailsByMode(mode) {
           // ── BƯỚC 2: Gọi Gemini parse chi tiết ────────────────────────────
           var parsed = null;
           try {
-            parsed = askGemini(subject, body.substring(0, 3000));
+            parsed = askGemini(subject, bodyPreview);
           } catch (e) {
             Logger.log("Gemini lỗi với mail '" + subject + "': " + e.message);
           }
@@ -239,8 +245,8 @@ function buildModeQuery(mode) {
 
 function isInvoiceEmail(subject, body) {
   var text = (subject + "\n" + body).toLowerCase();
-  for (var i = 0; i < INVOICE_KEYWORDS.length; i++) {
-    if (text.indexOf(INVOICE_KEYWORDS[i]) !== -1) return true;
+  for (var i = 0; i < INVOICE_KEYWORDS_LOWER.length; i++) {
+    if (text.indexOf(INVOICE_KEYWORDS_LOWER[i]) !== -1) return true;
   }
   return false;
 }
